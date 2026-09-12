@@ -1,4 +1,3 @@
-
 require('dotenv').config();
 const mqtt = require('mqtt');
 const { InfluxDB, Point } = require('@influxdata/influxdb-client');
@@ -38,10 +37,9 @@ client.on('connect', () => {
     });
 });
 
-// --- 4. DATA PROCESSING & CASCADING ALERT LOGIC ---
+// --- 4. DATA PROCESSING & BIDIRECTIONAL ALERT LOGIC ---
 client.on('message', async (topic, message) => {
     try {
-        // 1. කලින් (උඩ) ආකාරයටම JSON ලෙස දත්ත ලබාගැනීම
         const data = JSON.parse(message.toString());
         const waterLevel = data.water_level;
         const sensorId = data.sensor_id || 'sensor1';
@@ -50,12 +48,12 @@ client.on('message', async (topic, message) => {
         console.log(`\n========================================`);
         console.log(`[Data Received] Sensor: ${sensorId} | Water Level: ${waterLevel} cm`);
 
-        // 2. InfluxDB එකට Sensor Data Save කිරීම (කලින් තිබූ ආකෘතියටම)
+        // 2. InfluxDB එකට Sensor Data Save කිරීම
         try {
             const point = new Point('water_level_sensor')
-                .tag('sensor_id', sensorId) // දැන් මෙතනට එන්නේ JSON එකෙන් එන නමයි (S1 කියා hardcode නොවේ)
+                .tag('sensor_id', sensorId)
                 .floatField('water_level_cm', waterLevel)
-                .floatField('battery_pct', battery); // බැටරි ප්‍රතිශතයත් එකතු කර ඇත
+                .floatField('battery_pct', battery);
 
             writeApi.writePoint(point);
             await writeApi.flush();
@@ -65,61 +63,65 @@ client.on('message', async (topic, message) => {
         }
 
         // --- 3. Threshold-based Bidirectional Escalation & Recovery Alert Logic ---
-try {
-    // Supabase වලින් සියලුම areas වල threshold අගයන් ලබා ගැනීම (අනුපිළිවෙලට සකසා ගැනීම වැදගත් වේ)
-    const { data: areas, error: areaError } = await supabase
-        .from('areas')
-        .select('*')
-        .order('min_threshold', { ascending: true });
+        try {
+            const { data: areas, error: areaError } = await supabase
+                .from('areas')
+                .select('*')
+                .order('min_threshold', { ascending: true });
 
-    if (areaError) throw areaError;
+            if (areaError) throw areaError;
 
-    if (areas && areas.length > 0) {
-        for (const area of areas) {
-            const thresholdLimit = area.min_threshold; // උදා: 50 හෝ 70
-            let lastState = activeAlerts[area.area_name] || 'NORMAL'; // පෙර තත්ත්වය ('NORMAL', 'HIGH_UP', 'HIGH_DOWN')
+            if (areas && areas.length > 0) {
+                for (const area of areas) {
+                    const thresholdLimit = area.min_threshold; 
+                    let lastState = activeAlerts[area.area_name] || 'NORMAL'; 
 
-            // තත්ත්වය 1: ජල මට්ටම Threshold එකට වඩා වැඩි වීම (ඉහළ යෑම)
-            if (waterLevel >= thresholdLimit && lastState !== 'HIGH_UP') {
-                console.log(`🚨 Alert (Rising): Water level reached/crossed ${thresholdLimit}cm for ${area.area_name} (Current: ${waterLevel}cm)`);
+                    // තත්ත්වය 1: ජල මට්ටම Threshold එකට වඩා වැඩි වීම (ඉහළ යෑම)
+                    if (waterLevel >= thresholdLimit && lastState !== 'HIGH_UP') {
+                        console.log(`🚨 Alert (Rising): Water level reached/crossed ${thresholdLimit}cm for ${area.area_name} (Current: ${waterLevel}cm)`);
 
-                const { data: users, error: userError } = await supabase
-                    .from('users')
-                    .select('phone_number')
-                    .eq('area_id', area.id);
+                        const { data: users, error: userError } = await supabase
+                            .from('users')
+                            .select('phone_number')
+                            .eq('area_id', area.id);
 
-                if (userError) throw userError;
+                        if (userError) throw userError;
 
-                const phoneNumbers = users.map(u => u.phone_number);
-                if (phoneNumbers.length > 0) {
-                    sendCustomSMS(area.area_name, waterLevel, phoneNumbers, 'RISEN');
+                        const phoneNumbers = users.map(u => u.phone_number);
+                        if (phoneNumbers.length > 0) {
+                            sendCustomSMS(area.area_name, waterLevel, phoneNumbers, 'RISEN');
+                        }
+
+                        activeAlerts[area.area_name] = 'HIGH_UP';
+                    }
+                    // තත්ත්වය 2: ජල මට්ටම ඉහළ මට්ටමේ සිට අදාළ Threshold එකට වඩා පහළට බැසීම
+                    else if (waterLevel < thresholdLimit && lastState === 'HIGH_UP') {
+                        console.log(`📉 Alert (Dropping): Water level dropped below ${thresholdLimit}cm for ${area.area_name} (Current: ${waterLevel}cm)`);
+
+                        const { data: users, error: userError } = await supabase
+                            .from('users')
+                            .select('phone_number')
+                            .eq('area_id', area.id);
+
+                        if (userError) throw userError;
+
+                        const phoneNumbers = users.map(u => u.phone_number);
+                        if (phoneNumbers.length > 0) {
+                            sendCustomSMS(area.area_name, waterLevel, phoneNumbers, 'DROPPED');
+                        }
+
+                        activeAlerts[area.area_name] = 'NORMAL';
+                    }
                 }
-
-                activeAlerts[area.area_name] = 'HIGH_UP';
             }
-            // තත්ත්වය 2: ජල මට්ටම ඉහළ මට්ටමේ සිට අදාළ Threshold එකට වඩා පහළට බැසීම
-            else if (waterLevel < thresholdLimit && lastState === 'HIGH_UP') {
-                console.log(`📉 Alert (Dropping): Water level dropped below ${thresholdLimit}cm for ${area.area_name} (Current: ${waterLevel}cm)`);
-
-                const { data: users, error: userError } = await supabase
-                    .from('users')
-                    .select('phone_number')
-                    .eq('area_id', area.id);
-
-                if (userError) throw userError;
-
-                const phoneNumbers = users.map(u => u.phone_number);
-                if (phoneNumbers.length > 0) {
-                    sendCustomSMS(area.area_name, waterLevel, phoneNumbers, 'DROPPED');
-                }
-
-                activeAlerts[area.area_name] = 'NORMAL';
-            }
+        } catch (error) {
+            console.error('❌ Supabase Query Error:', error.message);
         }
+
+    } catch (error) {
+        console.error('❌ Invalid data format (JSON Data Parse Error):', error.message);
     }
-} catch (error) {
-    console.error('❌ Supabase Query Error:', error.message);
-}
+});
 
 // --- 5. UPDATED NOTIFY.LK SMS FUNCTION ---
 function sendCustomSMS(areaName, level, phoneNumbers, direction) {
@@ -129,7 +131,7 @@ function sendCustomSMS(areaName, level, phoneNumbers, direction) {
         if (formattedPhone.startsWith('0')) {
             formattedPhone = '94' + formattedPhone.substring(1);
         } else if (formattedPhone.startsWith('+94')) {
-            formattedPhone = 'formattedPhone.substring(1);' // හෝ substring(1)
+            formattedPhone = formattedPhone.substring(1); // නිවැරදි කරන ලදී
         }
 
         let messageText = "";
