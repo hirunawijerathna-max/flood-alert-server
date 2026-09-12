@@ -64,68 +64,80 @@ client.on('message', async (topic, message) => {
             console.error('❌ InfluxDB Error:', error.message);
         }
 
-        // 3. Cascading Alert Logic: min_threshold එක ජල මට්ටමට වඩා අඩු හෝ සමාන සියලුම Areas තෝරාගැනීම
-        try {
-            const { data: areas, error: areaError } = await supabase
-                .from('areas')
-                .select('*')
-                .lte('min_threshold', waterLevel);
+        // --- 3. Threshold-based Bidirectional Escalation & Recovery Alert Logic ---
+try {
+    // Supabase වලින් සියලුම areas වල threshold අගයන් ලබා ගැනීම (අනුපිළිවෙලට සකසා ගැනීම වැදගත් වේ)
+    const { data: areas, error: areaError } = await supabase
+        .from('areas')
+        .select('*')
+        .order('min_threshold', { ascending: true });
 
-            if (areaError) throw areaError;
+    if (areaError) throw areaError;
 
-            if (areas && areas.length > 0) {
-                for (const area of areas) {
-                    // මෙම Area එකට තවම Alert යවා නැත්නම් පමණක් SMS trigger කිරීම
-                    if (!activeAlerts[area.area_name]) {
-                        console.log(`🚨 Triggering Alert for: ${area.area_name}`);
+    if (areas && areas.length > 0) {
+        for (const area of areas) {
+            const thresholdLimit = area.min_threshold; // උදා: 50 හෝ 70
+            let lastState = activeAlerts[area.area_name] || 'NORMAL'; // පෙර තත්ත්වය ('NORMAL', 'HIGH_UP', 'HIGH_DOWN')
 
-                        // අදාළ Area එකට අයිති Usersලාගේ Phone Numbers Supabase එකෙන් ගැනීම
-                        const { data: users, error: userError } = await supabase
-                            .from('users')
-                            .select('phone_number')
-                            .eq('area_id', area.id);
+            // තත්ත්වය 1: ජල මට්ටම Threshold එකට වඩා වැඩි වීම (ඉහළ යෑම)
+            if (waterLevel >= thresholdLimit && lastState !== 'HIGH_UP') {
+                console.log(`🚨 Alert (Rising): Water level reached/crossed ${thresholdLimit}cm for ${area.area_name} (Current: ${waterLevel}cm)`);
 
-                        if (userError) throw userError;
+                const { data: users, error: userError } = await supabase
+                    .from('users')
+                    .select('phone_number')
+                    .eq('area_id', area.id);
 
-                        const phoneNumbers = users.map(u => u.phone_number);
-                        if (phoneNumbers.length > 0) {
-                            sendSMSAlerts(area.area_name, waterLevel, phoneNumbers);
-                        } else {
-                            console.log(`⚠️ No users found for ${area.area_name}`);
-                        }
-                        
-                        activeAlerts[area.area_name] = true;
-                    }
+                if (userError) throw userError;
+
+                const phoneNumbers = users.map(u => u.phone_number);
+                if (phoneNumbers.length > 0) {
+                    sendCustomSMS(area.area_name, waterLevel, phoneNumbers, 'RISEN');
                 }
-            } else {
-                // ජල මට්ටම සාමාන්‍ය තත්ත්වයට ආ විට Active Alerts Reset කිරීම
-                if (Object.keys(activeAlerts).length > 0) {
-                    console.log('🟢 Water level normalized. Resetting active alert state.');
-                    activeAlerts = {};
-                }
+
+                activeAlerts[area.area_name] = 'HIGH_UP';
             }
-        } catch (error) {
-            console.error('❌ Supabase Query Error:', error.message);
+            // තත්ත්වය 2: ජල මට්ටම ඉහළ මට්ටමේ සිට අදාළ Threshold එකට වඩා පහළට බැසීම
+            else if (waterLevel < thresholdLimit && lastState === 'HIGH_UP') {
+                console.log(`📉 Alert (Dropping): Water level dropped below ${thresholdLimit}cm for ${area.area_name} (Current: ${waterLevel}cm)`);
+
+                const { data: users, error: userError } = await supabase
+                    .from('users')
+                    .select('phone_number')
+                    .eq('area_id', area.id);
+
+                if (userError) throw userError;
+
+                const phoneNumbers = users.map(u => u.phone_number);
+                if (phoneNumbers.length > 0) {
+                    sendCustomSMS(area.area_name, waterLevel, phoneNumbers, 'DROPPED');
+                }
+
+                activeAlerts[area.area_name] = 'NORMAL';
+            }
         }
-
-    } catch (error) {
-        // අහම්බෙන් හෝ JSON නොවන දත්තයක් ආවොත් පද්ධතිය බිඳ වැටීම වළක්වයි
-        console.error('❌ Invalid data format (JSON Data Parse Error):', error.message);
     }
-});
+} catch (error) {
+    console.error('❌ Supabase Query Error:', error.message);
+}
 
-// --- 5. NOTIFY.LK SMS FUNCTION ---
-function sendSMSAlerts(areaName, level, phoneNumbers) {
+// --- 5. UPDATED NOTIFY.LK SMS FUNCTION ---
+function sendCustomSMS(areaName, level, phoneNumbers, direction) {
     phoneNumbers.forEach(phoneNumber => {
         let formattedPhone = phoneNumber.toString().trim();
         
         if (formattedPhone.startsWith('0')) {
             formattedPhone = '94' + formattedPhone.substring(1);
         } else if (formattedPhone.startsWith('+94')) {
-            formattedPhone = formattedPhone.substring(1);
+            formattedPhone = 'formattedPhone.substring(1);' // හෝ substring(1)
         }
 
-        const messageText = `FLOOD ALERT: ${areaName} - Water level reached ${level}cm. Please move to a safe location!`;
+        let messageText = "";
+        if (direction === 'RISEN') {
+            messageText = `FLOOD ALERT: ${areaName} - Water level rose to ${level}cm. Please stay alert!`;
+        } else {
+            messageText = `WATER LEVEL UPDATE: ${areaName} - Water level dropped to ${level}cm. Situation normalizing.`;
+        }
 
         const notifyUrl = `https://app.notify.lk/api/v1/send` +
             `?user_id=${process.env.NOTIFY_USER_ID}` +
@@ -139,12 +151,7 @@ function sendSMSAlerts(areaName, level, phoneNumbers) {
                 console.log(`📱 Notify.lk Response for ${formattedPhone}:`, res.data);
             })
             .catch(err => {
-                if (err.response) {
-                    // API එකෙන් එවපු නිශ්චිත Error එක පෙන්වීම
-                    console.error(`❌ Notify.lk API Error (${formattedPhone}) [Status ${err.response.status}]:`, err.response.data);
-                } else {
-                    console.error(`❌ SMS Request Error (${formattedPhone}):`, err.message);
-                }
+                console.error(`❌ SMS Request Error (${formattedPhone}):`, err.message);
             });
     });
 }
