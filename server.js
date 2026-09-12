@@ -37,16 +37,16 @@ client.on('connect', () => {
     });
 });
 
-// --- 4. DATA PROCESSING & BIDIRECTIONAL ALERT LOGIC ---
+// --- 4. DATA PROCESSING & DISTANCE-BASED BIDIRECTIONAL ALERT LOGIC ---
 client.on('message', async (topic, message) => {
     try {
         const data = JSON.parse(message.toString());
-        const waterLevel = data.water_level;
+        const waterLevel = data.water_level; // මෙහිදී ලැබෙන්නේ සෙන්සර් දුර (distance) වේ
         const sensorId = data.sensor_id || 'sensor1';
         const battery = data.battery || 100;
 
         console.log(`\n========================================`);
-        console.log(`[Data Received] Sensor: ${sensorId} | Water Level: ${waterLevel} cm`);
+        console.log(`[Data Received] Sensor: ${sensorId} | Sensor Distance: ${waterLevel} cm`);
 
         // 2. InfluxDB එකට Sensor Data Save කිරීම
         try {
@@ -62,7 +62,7 @@ client.on('message', async (topic, message) => {
             console.error('❌ InfluxDB Error:', error.message);
         }
 
-        // --- 3. Threshold-based Bidirectional Escalation & Recovery Alert Logic ---
+        // --- 3. Distance-based Decreasing Escalation & Recovery Alert Logic ---
         try {
             const { data: areas, error: areaError } = await supabase
                 .from('areas')
@@ -76,9 +76,9 @@ client.on('message', async (topic, message) => {
                     const thresholdLimit = area.min_threshold; 
                     let lastState = activeAlerts[area.area_name] || 'NORMAL'; 
 
-                    // තත්ත්වය 1: ජල මට්ටම Threshold එකට වඩා වැඩි වීම (ඉහළ යෑම)
-                    if (waterLevel >= thresholdLimit && lastState !== 'HIGH_UP') {
-                        console.log(`🚨 Alert (Rising): Water level reached/crossed ${thresholdLimit}cm for ${area.area_name} (Current: ${waterLevel}cm)`);
+                    // තත්ත්වය 1: දුර අඩුවී threshold අගයට වඩා අඩු හෝ සමාන වීම (වතුර ඉහළ නැගීම / අවදානම වැඩි වීම)
+                    if (waterLevel <= thresholdLimit && lastState !== 'HIGH_UP') {
+                        console.log(`🚨 Alert (Danger): Distance dropped to/below ${thresholdLimit}cm for ${area.area_name} (Current Distance: ${waterLevel}cm)`);
 
                         const { data: users, error: userError } = await supabase
                             .from('users')
@@ -94,9 +94,9 @@ client.on('message', async (topic, message) => {
 
                         activeAlerts[area.area_name] = 'HIGH_UP';
                     }
-                    // තත්ත්වය 2: ජල මට්ටම ඉහළ මට්ටමේ සිට අදාළ Threshold එකට වඩා පහළට බැසීම
-                    else if (waterLevel < thresholdLimit && lastState === 'HIGH_UP') {
-                        console.log(`📉 Alert (Dropping): Water level dropped below ${thresholdLimit}cm for ${area.area_name} (Current: ${waterLevel}cm)`);
+                    // තත්ත්වය 2: දුර වැඩි වී threshold අගයට වඩා ඉහළ යාම (වතුර බැසීම / තත්ත්වය සාමාන්‍ය වීම)
+                    else if (waterLevel > thresholdLimit && lastState === 'HIGH_UP') {
+                        console.log(`📉 Alert (Safe): Distance increased above ${thresholdLimit}cm for ${area.area_name} (Current Distance: ${waterLevel}cm)`);
 
                         const { data: users, error: userError } = await supabase
                             .from('users')
@@ -123,7 +123,7 @@ client.on('message', async (topic, message) => {
     }
 });
 
-// --- 5. UPDATED NOTIFY.LK SMS FUNCTION ---
+// --- 5. UPDATED NOTIFY.LK SMS FUNCTION (WITHOUT CM) ---
 function sendCustomSMS(areaName, level, phoneNumbers, direction) {
     phoneNumbers.forEach(phoneNumber => {
         let formattedPhone = phoneNumber.toString().trim();
@@ -131,14 +131,14 @@ function sendCustomSMS(areaName, level, phoneNumbers, direction) {
         if (formattedPhone.startsWith('0')) {
             formattedPhone = '94' + formattedPhone.substring(1);
         } else if (formattedPhone.startsWith('+94')) {
-            formattedPhone = formattedPhone.substring(1); // නිවැරදි කරන ලදී
+            formattedPhone = formattedPhone.substring(1);
         }
 
         let messageText = "";
         if (direction === 'RISEN') {
-            messageText = `FLOOD ALERT: ${areaName} - Water level rose to ${level}cm. Please stay alert!`;
+            messageText = `FLOOD ALERT: ${areaName} - Water level is rising dangerously! Please stay alert.`;
         } else {
-            messageText = `WATER LEVEL UPDATE: ${areaName} - Water level dropped to ${level}cm. Situation normalizing.`;
+            messageText = `WATER LEVEL UPDATE: ${areaName} - Water level is receding. Situation is normalizing.`;
         }
 
         const notifyUrl = `https://app.notify.lk/api/v1/send` +
