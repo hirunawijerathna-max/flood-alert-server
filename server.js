@@ -37,16 +37,16 @@ client.on('connect', () => {
     });
 });
 
-// --- 4. DATA PROCESSING & DISTANCE-BASED BIDIRECTIONAL ALERT LOGIC ---
+// --- 4. DATA PROCESSING & BIDIRECTIONAL ALERT LOGIC ---
 client.on('message', async (topic, message) => {
     try {
         const data = JSON.parse(message.toString());
-        const waterLevel = data.water_level; // මෙහිදී ලැබෙන්නේ සෙන්සර් දුර (distance) වේ
+        const waterLevel = data.water_level; // සෙන්සර් දුර (distance)
         const sensorId = data.sensor_id || 'sensor1';
         const battery = data.battery || 100;
 
         console.log(`\n========================================`);
-        console.log(`[Data Received] Sensor: ${sensorId} | Sensor Distance: ${waterLevel} cm`);
+        console.log(`[Data Received] Sensor: ${sensorId} | Water Level: ${waterLevel} cm`);
 
         // 2. InfluxDB එකට Sensor Data Save කිරීම
         try {
@@ -62,7 +62,7 @@ client.on('message', async (topic, message) => {
             console.error('❌ InfluxDB Error:', error.message);
         }
 
-        // --- 3. Distance-based Decreasing Escalation & Recovery Alert Logic ---
+        // --- 3. Threshold-based Bidirectional Escalation & Recovery Alert Logic ---
         try {
             const { data: areas, error: areaError } = await supabase
                 .from('areas')
@@ -78,7 +78,7 @@ client.on('message', async (topic, message) => {
 
                     // තත්ත්වය 1: දුර අඩුවී threshold අගයට වඩා අඩු හෝ සමාන වීම (වතුර ඉහළ නැගීම / අවදානම වැඩි වීම)
                     if (waterLevel <= thresholdLimit && lastState !== 'HIGH_UP') {
-                        console.log(`🚨 Alert (Danger): Distance dropped to/below ${thresholdLimit}cm for ${area.area_name} (Current Distance: ${waterLevel}cm)`);
+                        console.log(`🚨 Alert (Danger): Water level reached threshold ${thresholdLimit}cm for ${area.area_name} (Current: ${waterLevel}cm)`);
 
                         const { data: users, error: userError } = await supabase
                             .from('users')
@@ -96,7 +96,7 @@ client.on('message', async (topic, message) => {
                     }
                     // තත්ත්වය 2: දුර වැඩි වී threshold අගයට වඩා ඉහළ යාම (වතුර බැසීම / තත්ත්වය සාමාන්‍ය වීම)
                     else if (waterLevel > thresholdLimit && lastState === 'HIGH_UP') {
-                        console.log(`📉 Alert (Safe): Distance increased above ${thresholdLimit}cm for ${area.area_name} (Current Distance: ${waterLevel}cm)`);
+                        console.log(`📉 Alert (Safe): Water level receded above ${thresholdLimit}cm for ${area.area_name} (Current: ${waterLevel}cm)`);
 
                         const { data: users, error: userError } = await supabase
                             .from('users')
@@ -123,15 +123,16 @@ client.on('message', async (topic, message) => {
     }
 });
 
-// --- 5. UPDATED NOTIFY.LK SMS FUNCTION (WITHOUT CM) ---
+// --- 5. UPDATED NOTIFY.LK SMS FUNCTION (WITH PROPER PHONE CLEANING) ---
 function sendCustomSMS(areaName, level, phoneNumbers, direction) {
     phoneNumbers.forEach(phoneNumber => {
-        let formattedPhone = phoneNumber.toString().trim();
+        // අංකයේ ඇති අනවශ්‍ය අක්ෂර ඉවත් කර අංක පමණක් ලබා ගැනීම
+        let cleanedPhone = phoneNumber.toString().trim().replace(/[^0-9]/g, '');
         
-        if (formattedPhone.startsWith('0')) {
-            formattedPhone = '94' + formattedPhone.substring(1);
-        } else if (formattedPhone.startsWith('+94')) {
-            formattedPhone = formattedPhone.substring(1);
+        if (cleanedPhone.startsWith('0')) {
+            cleanedPhone = '94' + cleanedPhone.substring(1);
+        } else if (cleanedPhone.length === 9) {
+            cleanedPhone = '94' + cleanedPhone;
         }
 
         let messageText = "";
@@ -145,15 +146,19 @@ function sendCustomSMS(areaName, level, phoneNumbers, direction) {
             `?user_id=${process.env.NOTIFY_USER_ID}` +
             `&api_key=${process.env.NOTIFY_API_KEY}` +
             `&sender_id=${process.env.NOTIFY_SENDER_ID}` +
-            `&to=${formattedPhone}` +
+            `&to=${cleanedPhone}` +
             `&message=${encodeURIComponent(messageText)}`;
 
         axios.get(notifyUrl)
             .then(res => {
-                console.log(`📱 Notify.lk Response for ${formattedPhone}:`, res.data);
+                console.log(`📱 Notify.lk Response for ${cleanedPhone}:`, res.data);
             })
             .catch(err => {
-                console.error(`❌ SMS Request Error (${formattedPhone}):`, err.message);
+                if (err.response) {
+                    console.error(`❌ SMS API Error (${cleanedPhone}) [Status ${err.response.status}]:`, err.response.data);
+                } else {
+                    console.error(`❌ SMS Request Error (${cleanedPhone}):`, err.message);
+                }
             });
     });
 }
