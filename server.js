@@ -67,7 +67,7 @@ client.on('message', async (topic, message) => {
             const { data: areas, error: areaError } = await supabase
                 .from('areas')
                 .select('*')
-                .order('min_threshold', { ascending: true }); // 28, 30, 32
+                .order('min_threshold', { ascending: true }); // 4, 6, 8, 10 පිළිවෙළට ස්වයංක්‍රීයව සැකසේ
 
             if (areaError) throw areaError;
 
@@ -87,13 +87,13 @@ client.on('message', async (topic, message) => {
 
                     // තත්ත්වය A: ජල මට්ටම අදාළ කලාපයේ අවදානම් සීමාවට වඩා වැඩි නම්
                     if (waterLevel >= thresholdLimit) {
-                        
+
                         // අලුත්ම අවදානම් සීමාවක් පැනලා නම් (පහළ කලාප වලට Update එකක් හෝ අලුත් කලාපයට මුල් SMS එක)
                         if (lastState === 'NORMAL' || maxCrossedThreshold > lastState) {
-                            
+
                             // අලුත් Alert එකක් ද නැත්නම් Update එකක් ද යන්න තීරණය කිරීම
                             let alertType = (lastState === 'NORMAL') ? 'RISEN' : 'UPDATE_RISEN';
-                            
+
                             console.log(`🚨 Alert (${alertType}): Limit reached ${maxCrossedThreshold}m! Sending to ${area.area_name} (Current: ${waterLevel}m)`);
 
                             const { data: users, error: userError } = await supabase
@@ -111,8 +111,8 @@ client.on('message', async (topic, message) => {
                             // අදාළ කලාපයේ අලුත්ම තත්ත්වය උපරිම Threshold එක ලෙස සටහන් කිරීම
                             activeAlerts[area.area_name] = maxCrossedThreshold;
                         } 
-                        // ජල මට්ටම ඉහළම සීමාවෙන් (උදා: 32න්) පහළට බැස්සත්, තවමත් මේ කලාපයේ (උදා: 28) සීමාවට වඩා වැඩිනම්,
-                        // SMS නොයවා State එක පමණක් නිහඬව Update කිරීම (නැවත ඉහළ ගියොත් Update SMS යැවීමට පහසු වීමට)
+                        // ජල මට්ටම ඉහළම සීමාවෙන් පහළට බැස්සත්, තවමත් මේ කලාපයේ සීමාවට වඩා වැඩිනම්,
+                        // SMS නොයවා State එක පමණක් නිහඬව Update කිරීම
                         else if (maxCrossedThreshold < lastState) {
                             activeAlerts[area.area_name] = maxCrossedThreshold;
                         }
@@ -148,11 +148,11 @@ client.on('message', async (topic, message) => {
     }
 });
 
-// --- 5. UPDATED NOTIFY.LK SMS FUNCTION (WITH 'UPDATE' MESSAGE) ---
+// --- 5. UPDATED NOTIFY.LK SMS FUNCTION (MEANINGFUL ALERTS) ---
 function sendCustomSMS(areaName, level, phoneNumbers, direction) {
     phoneNumbers.forEach(phoneNumber => {
         let cleanedPhone = phoneNumber.toString().trim().replace(/[^0-9]/g, '');
-        
+
         if (cleanedPhone.startsWith('0')) {
             cleanedPhone = '94' + cleanedPhone.substring(1);
         } else if (cleanedPhone.length === 9) {
@@ -160,15 +160,22 @@ function sendCustomSMS(areaName, level, phoneNumbers, direction) {
         }
 
         let messageText = "";
-        if (direction === 'RISEN') {
-            // පළමු වතාවට අවදානම් සීමාව පනිද්දී යන පණිවිඩය
-            messageText = `FLOOD ALERT: ${areaName} - Water level rose to ${level}m. Please stay alert!`;
-        } else if (direction === 'UPDATE_RISEN') {
-            // තවත් අවදානම් සීමාවක් ඉක්මවා වතුර වැඩි වෙද්දී පහළ කලාප වලට යන 'Update' පණිවිඩය
-            messageText = `FLOOD UPDATE: ${areaName} - Water level increased further to ${level}m. Danger is escalating!`;
-        } else {
-            // ජල මට්ටම බැස යද්දී අදාළ කලාපයට යන පණිවිඩය
-            messageText = `WATER LEVEL UPDATE: ${areaName} - Water level dropped to ${level}m. Situation normalizing.`;
+        // ඩේටාබේස් එකේ නම (උදා: alert flood) කැපිටල් අකුරු බවට පත් කිරීම (උදා: ALERT FLOOD)
+        let statusName = areaName.toUpperCase(); 
+        
+        // Critical මට්ටම සඳහා විශේෂිත වූ හදිසි පණිවිඩය
+        if (areaName.toLowerCase() === 'critical' && (direction === 'RISEN' || direction === 'UPDATE_RISEN')) {
+            messageText = `🚨 EXTREME DANGER: CRITICAL flood level reached (${level}m)! EVACUATE IMMEDIATELY!`;
+        } 
+        // අනෙකුත් සාමාන්‍ය මට්ටම් සඳහා
+        else {
+            if (direction === 'RISEN') {
+                messageText = `⚠️ FLOOD WARNING: Status is now ${statusName}. Water level rose to ${level}m. Please stay alert!`;
+            } else if (direction === 'UPDATE_RISEN') {
+                messageText = `📈 FLOOD ESCALATION: Status worsened to ${statusName}. Water level increased to ${level}m. Stay safe!`;
+            } else {
+                messageText = `📉 LEVEL DROP: Status downgraded to ${statusName}. Water level dropped to ${level}m. Situation normalizing.`;
+            }
         }
 
         const notifyUrl = `https://app.notify.lk/api/v1/send` +
