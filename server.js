@@ -1,157 +1,366 @@
+
 require('dotenv').config();
+
+const http = require('http');
 const mqtt = require('mqtt');
 const { InfluxDB, Point } = require('@influxdata/influxdb-client');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
 
-// --- 1. SUPABASE SETUP ---
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+// ==================================================
+// 1. ENVIRONMENT CONFIGURATION
+// ==================================================
 
-// --- 2. INFLUXDB SETUP ---
-const influxDB = new InfluxDB({ 
-    url: process.env.INFLUX_URL, 
-    token: process.env.INFLUX_TOKEN 
+const PORT = process.env.PORT || 3000;
+
+const requiredVariables = [
+    'MQTT_HOST',
+    'MQTT_PORT',
+    'MQTT_USER',
+    'MQTT_PASS',
+    'MQTT_TOPIC',
+    'INFLUX_URL',
+    'INFLUX_TOKEN',
+    'INFLUX_ORG',
+    'INFLUX_BUCKET',
+    'SUPABASE_URL',
+    'SUPABASE_KEY',
+    'NOTIFY_USER_ID',
+    'NOTIFY_API_KEY',
+    'NOTIFY_SENDER_ID'
+];
+
+const missingVariables = requiredVariables.filter(
+    key => !process.env[key]
+);
+
+if (missingVariables.length > 0) {
+    console.error('Missing environment variables:', missingVariables.join(', '));
+    process.exit(1);
+}
+
+// ==================================================
+// 2. SUPABASE SETUP
+// ==================================================
+
+const supabase = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_KEY
+);
+
+// ==================================================
+// 3. INFLUXDB SETUP
+// ==================================================
+
+const influxDB = new InfluxDB({
+    url: process.env.INFLUX_URL,
+    token: process.env.INFLUX_TOKEN
 });
-const writeApi = influxDB.getWriteApi(process.env.INFLUX_ORG, process.env.INFLUX_BUCKET);
 
-// යැවූ Alerts නැවත නැවත යැවීම වැළැක්වීමට සහ Level Update කිරීම සඳහා (State Tracking)
-let activeAlerts = {}; 
+const writeApi = influxDB.getWriteApi(
+    process.env.INFLUX_ORG,
+    process.env.INFLUX_BUCKET
+);
 
-// --- 3. MQTT SETUP ---
+// ==================================================
+// 4. MQTT SETUP
+// ==================================================
+
 const mqttOptions = {
-    port: parseInt(process.env.MQTT_PORT),
+    port: Number(process.env.MQTT_PORT),
     username: process.env.MQTT_USER,
     password: process.env.MQTT_PASS,
     protocol: 'mqtts',
-    rejectUnauthorized: false
+    rejectUnauthorized: true,
+    reconnectPeriod: 5000,
+    connectTimeout: 30000,
+    clientId: `HydroSentinel_${Math.random().toString(16).slice(2, 10)}`
 };
 
-const client = mqtt.connect(process.env.MQTT_HOST, mqttOptions);
+console.log('Connecting to HiveMQ Cloud...');
+
+const client = mqtt.connect(
+    process.env.MQTT_HOST,
+    mqttOptions
+);
 
 client.on('connect', () => {
-    console.log('✅ Connected to HiveMQ Cloud Broker successfully!');
-    client.subscribe(process.env.MQTT_TOPIC, (err) => {
-        if (!err) {
-            console.log(`📡 Subscribed to topic: ${process.env.MQTT_TOPIC}`);
+    console.log('HiveMQ Connected Successfully!');
+
+    client.subscribe(
+        process.env.MQTT_TOPIC,
+        { qos: 1 },
+        (err) => {
+            if (err) {
+                console.error('MQTT Subscribe Error:', err.message);
+            } else {
+                console.log('Subscribed to:', process.env.MQTT_TOPIC);
+            }
         }
-    });
+    );
 });
 
-// --- 4. DATA PROCESSING & ADVANCED CUMULATIVE UPDATE LOGIC ---
-client.on('message', async (topic, message) => {
+client.on('error', (err) => {
+    console.error('MQTT Connection Error:', err.message);
+});
+
+client.on('reconnect', () => {
+    console.log('MQTT Reconnecting...');
+});
+
+client.on('offline', () => {
+    console.log('MQTT Client Offline');
+});
+
+client.on('close', () => {
+    console.log('MQTT Connection Closed');
+});
+
+// ==================================================
+// 5. ALERT STATE TRACKING
+// ==================================================
+
+let activeAlerts = {};
+
+// Prevent overlapping message processing
+let processingQueue = Promise.resolve();
+
+// ==================================================
+// 6. MQTT MESSAGE RECEIVING
+// ==================================================
+
+client.on('message', (topic, message) => {
+
+    processingQueue = processingQueue
+        .then(() => processSensorData(topic, message))
+        .catch(err => {
+            console.error('Message Processing Error:', err.message);
+        });
+
+});
+
+// ==================================================
+// 7. SENSOR DATA PROCESSING
+// ==================================================
+
+async function processSensorData(topic, message) {
+
+    let data;
+
     try {
-        const data = JSON.parse(message.toString());
-        const waterLevel = data.water_level; // මීටර් වලින් එන අගය
-        const sensorId = data.sensor_id || 'sensor1';
-        const battery = data.battery || 100;
+        data = JSON.parse(message.toString());
+    } catch (err) {
+        console.error('Invalid JSON:', err.message);
+        return;
+    }
 
-        console.log(`\n========================================`);
-        console.log(`[Data Received] Sensor: ${sensorId} | Water Level: ${waterLevel} m`);
+    const waterLevel = Number(data.water_level);
+    const sensorId = data.sensor_id || 'sensor1';
+    const battery = Number(data.battery ?? 100);
 
-        // InfluxDB එකට Sensor Data Save කිරීම
-        try {
-            const point = new Point('water_level_sensor')
-                .tag('sensor_id', sensorId)
-                .floatField('water_level_m', waterLevel)
-                .floatField('battery_pct', battery);
+    if (!Number.isFinite(waterLevel) || !Number.isFinite(battery)) {
+        console.error('Invalid sensor values');
+        return;
+    }
 
-            writeApi.writePoint(point);
-            await writeApi.flush();
-            console.log('📊 InfluxDB: Data saved successfully.');
-        } catch (error) {
-            console.error('❌ InfluxDB Error:', error.message);
+    console.log('\n====================================');
+    console.log('SENSOR DATA RECEIVED');
+    console.log('Sensor ID:', sensorId);
+    console.log('Water Level:', waterLevel, 'm');
+    console.log('Battery:', battery, '%');
+    console.log('====================================');
+
+    // ----------------------------------------------
+    // INFLUXDB DATA STORAGE
+    // ----------------------------------------------
+
+    try {
+        const point = new Point('water_level_sensor')
+            .tag('sensor_id', String(sensorId))
+            .floatField('water_level_m', waterLevel)
+            .floatField('battery_pct', battery);
+
+        writeApi.writePoint(point);
+        await writeApi.flush();
+
+        console.log('InfluxDB: Data Saved Successfully');
+
+    } catch (error) {
+        console.error('InfluxDB Error:', error.message);
+    }
+
+    // ----------------------------------------------
+    // SUPABASE THRESHOLD PROCESSING
+    // ----------------------------------------------
+
+    try {
+
+        const { data: areas, error: areaError } = await supabase
+            .from('areas')
+            .select('*')
+            .order('min_threshold', { ascending: true });
+
+        if (areaError) throw areaError;
+
+        if (!areas || areas.length === 0) {
+            console.log('No areas found in Supabase');
+            return;
         }
 
-        // --- Threshold-based Escalation, Updates & Recovery Logic ---
-        try {
-            const { data: areas, error: areaError } = await supabase
-                .from('areas')
-                .select('*')
-                .order('min_threshold', { ascending: true }); // 4, 6, 8, 10 පිළිවෙළට ස්වයංක්‍රීයව සැකසේ
+        let maxCrossedThreshold = 0;
 
-            if (areaError) throw areaError;
+        for (const area of areas) {
 
-            if (areas && areas.length > 0) {
-                // 1. දැනට වතුර මට්ටම පහුකරපු 'උපරිම' සීමාව (Max Threshold) සොයාගැනීම
-                let maxCrossedThreshold = 0;
-                for (const area of areas) {
-                    if (waterLevel >= area.min_threshold) {
-                        maxCrossedThreshold = Math.max(maxCrossedThreshold, area.min_threshold);
-                    }
-                }
+            const threshold = Number(area.min_threshold);
 
-                // 2. එක් එක් කලාපයට අදාළව ඇට් යැවීම සහ යාවත්කාලීන කිරීම
-                for (const area of areas) {
-                    const thresholdLimit = area.min_threshold; 
-                    let lastState = activeAlerts[area.area_name] || 'NORMAL'; 
+            if (waterLevel >= threshold) {
+                maxCrossedThreshold = Math.max(
+                    maxCrossedThreshold,
+                    threshold
+                );
+            }
+        }
 
-                    // තත්ත්වය A: ජල මට්ටම අදාළ කලාපයේ අවදානම් සීමාවට වඩා වැඩි නම්
-                    if (waterLevel >= thresholdLimit) {
+        for (const area of areas) {
 
-                        // අලුත්ම අවදානම් සීමාවක් පැනලා නම් (පහළ කලාප වලට Update එකක් හෝ අලුත් කලාපයට මුල් SMS එක)
-                        if (lastState === 'NORMAL' || maxCrossedThreshold > lastState) {
+            const thresholdLimit = Number(area.min_threshold);
 
-                            // අලුත් Alert එකක් ද නැත්නම් Update එකක් ද යන්න තීරණය කිරීම
-                            let alertType = (lastState === 'NORMAL') ? 'RISEN' : 'UPDATE_RISEN';
+            const lastState =
+                activeAlerts[area.area_name] ?? 'NORMAL';
 
-                            console.log(`🚨 Alert (${alertType}): Limit reached ${maxCrossedThreshold}m! Sending to ${area.area_name} (Current: ${waterLevel}m)`);
+            // WATER LEVEL RISEN
+            if (waterLevel >= thresholdLimit) {
 
-                            const { data: users, error: userError } = await supabase
-                                .from('users')
-                                .select('phone_number')
-                                .eq('area_id', area.id);
+                if (
+                    lastState === 'NORMAL' ||
+                    maxCrossedThreshold > lastState
+                ) {
 
-                            if (userError) throw userError;
+                    const alertType =
+                        lastState === 'NORMAL'
+                            ? 'RISEN'
+                            : 'UPDATE_RISEN';
 
-                            const phoneNumbers = users.map(u => u.phone_number);
-                            if (phoneNumbers.length > 0) {
-                                sendCustomSMS(area.area_name, waterLevel, phoneNumbers, alertType);
-                            }
+                    console.log(
+                        `FLOOD ALERT: ${area.area_name} - ${waterLevel}m`
+                    );
 
-                            // අදාළ කලාපයේ අලුත්ම තත්ත්වය උපරිම Threshold එක ලෙස සටහන් කිරීම
-                            activeAlerts[area.area_name] = maxCrossedThreshold;
-                        } 
-                        // ජල මට්ටම ඉහළම සීමාවෙන් පහළට බැස්සත්, තවමත් මේ කලාපයේ සීමාවට වඩා වැඩිනම්,
-                        // SMS නොයවා State එක පමණක් නිහඬව Update කිරීම
-                        else if (maxCrossedThreshold < lastState) {
-                            activeAlerts[area.area_name] = maxCrossedThreshold;
-                        }
-
-                    } 
-                    // තත්ත්වය B: ජල මට්ටම අදාළ කලාපයේ Threshold එකට වඩා සම්පූර්ණයෙන්ම පහළට බැසීම (Dropping)
-                    else if (waterLevel < thresholdLimit && lastState !== 'NORMAL') {
-                        console.log(`📉 Alert (Dropping): Water level dropped below ${thresholdLimit}m for ${area.area_name} (Current: ${waterLevel}m)`);
-
-                        const { data: users, error: userError } = await supabase
+                    const { data: users, error: userError } =
+                        await supabase
                             .from('users')
                             .select('phone_number')
                             .eq('area_id', area.id);
 
-                        if (userError) throw userError;
+                    if (userError) throw userError;
 
-                        const phoneNumbers = users.map(u => u.phone_number);
-                        if (phoneNumbers.length > 0) {
-                            sendCustomSMS(area.area_name, waterLevel, phoneNumbers, 'DROPPED');
-                        }
+                    const phoneNumbers = (users || [])
+                        .map(user => user.phone_number)
+                        .filter(Boolean);
 
-                        // කලාපයේ තත්ත්වය නැවත සාමාන්‍ය (NORMAL) කිරීම
-                        activeAlerts[area.area_name] = 'NORMAL';
+                    if (phoneNumbers.length > 0) {
+                        await sendCustomSMS(
+                            area.area_name,
+                            waterLevel,
+                            phoneNumbers,
+                            alertType
+                        );
                     }
+
+                    activeAlerts[area.area_name] =
+                        maxCrossedThreshold;
                 }
+
+                else if (maxCrossedThreshold < lastState) {
+                    activeAlerts[area.area_name] =
+                        maxCrossedThreshold;
+                }
+
             }
-        } catch (error) {
-            console.error('❌ Supabase Query Error:', error.message);
+
+            // WATER LEVEL DROPPED
+            else if (
+                waterLevel < thresholdLimit &&
+                lastState !== 'NORMAL'
+            ) {
+
+                console.log(
+                    `WATER LEVEL DROPPED: ${area.area_name}`
+                );
+
+                const { data: users, error: userError } =
+                    await supabase
+                        .from('users')
+                        .select('phone_number')
+                        .eq('area_id', area.id);
+
+                if (userError) throw userError;
+
+                const phoneNumbers = (users || [])
+                    .map(user => user.phone_number)
+                    .filter(Boolean);
+
+                if (phoneNumbers.length > 0) {
+                    await sendCustomSMS(
+                        area.area_name,
+                        waterLevel,
+                        phoneNumbers,
+                        'DROPPED'
+                    );
+                }
+
+                activeAlerts[area.area_name] = 'NORMAL';
+            }
         }
 
     } catch (error) {
-        console.error('❌ Invalid data format (JSON Data Parse Error):', error.message);
+        console.error('Supabase Error:', error.message);
     }
-});
+}
 
-// --- 5. UPDATED NOTIFY.LK SMS FUNCTION (MEANINGFUL ALERTS) ---
-function sendCustomSMS(areaName, level, phoneNumbers, direction) {
-    phoneNumbers.forEach(phoneNumber => {
-        let cleanedPhone = phoneNumber.toString().trim().replace(/[^0-9]/g, '');
+// ==================================================
+// 8. NOTIFY.LK SMS FUNCTION
+// ==================================================
+
+async function sendCustomSMS(
+    areaName,
+    level,
+    phoneNumbers,
+    direction
+) {
+
+    const statusName = String(areaName).toUpperCase();
+
+    let messageText = '';
+
+    if (
+        String(areaName).toLowerCase() === 'critical' &&
+        (direction === 'RISEN' || direction === 'UPDATE_RISEN')
+    ) {
+
+        messageText =
+            `EXTREME DANGER: CRITICAL flood level reached (${level}m)! Follow official emergency instructions.`;
+
+    } else if (direction === 'RISEN') {
+
+        messageText =
+            `FLOOD WARNING: Status is now ${statusName}. Water level: ${level}m. Please stay alert!`;
+
+    } else if (direction === 'UPDATE_RISEN') {
+
+        messageText =
+            `FLOOD ESCALATION: Status worsened to ${statusName}. Water level: ${level}m. Stay safe!`;
+
+    } else {
+
+        messageText =
+            `LEVEL DROP: Status downgraded to ${statusName}. Water level: ${level}m. Follow official updates.`;
+    }
+
+    for (const phoneNumber of phoneNumbers) {
+
+        let cleanedPhone = String(phoneNumber)
+            .trim()
+            .replace(/[^0-9]/g, '');
 
         if (cleanedPhone.startsWith('0')) {
             cleanedPhone = '94' + cleanedPhone.substring(1);
@@ -159,42 +368,96 @@ function sendCustomSMS(areaName, level, phoneNumbers, direction) {
             cleanedPhone = '94' + cleanedPhone;
         }
 
-        let messageText = "";
-        // ඩේටාබේස් එකේ නම (උදා: alert flood) කැපිටල් අකුරු බවට පත් කිරීම (උදා: ALERT FLOOD)
-        let statusName = areaName.toUpperCase(); 
-        
-        // Critical මට්ටම සඳහා විශේෂිත වූ හදිසි පණිවිඩය
-        if (areaName.toLowerCase() === 'critical' && (direction === 'RISEN' || direction === 'UPDATE_RISEN')) {
-            messageText = `🚨 EXTREME DANGER: CRITICAL flood level reached (${level}m)! EVACUATE IMMEDIATELY!`;
-        } 
-        // අනෙකුත් සාමාන්‍ය මට්ටම් සඳහා
-        else {
-            if (direction === 'RISEN') {
-                messageText = `⚠️ FLOOD WARNING: Status is now ${statusName}. Water level rose to ${level}m. Please stay alert!`;
-            } else if (direction === 'UPDATE_RISEN') {
-                messageText = `📈 FLOOD ESCALATION: Status worsened to ${statusName}. Water level increased to ${level}m. Stay safe!`;
-            } else {
-                messageText = `📉 LEVEL DROP: Status downgraded to ${statusName}. Water level dropped to ${level}m. Situation normalizing.`;
-            }
-        }
+        try {
 
-        const notifyUrl = `https://app.notify.lk/api/v1/send` +
-            `?user_id=${process.env.NOTIFY_USER_ID}` +
-            `&api_key=${process.env.NOTIFY_API_KEY}` +
-            `&sender_id=${process.env.NOTIFY_SENDER_ID}` +
-            `&to=${cleanedPhone}` +
-            `&message=${encodeURIComponent(messageText)}`;
-
-        axios.get(notifyUrl)
-            .then(res => {
-                console.log(`📱 Notify.lk Response for ${cleanedPhone}:`, res.data);
-            })
-            .catch(err => {
-                if (err.response) {
-                    console.error(`❌ SMS API Error (${cleanedPhone}) [Status ${err.response.status}]:`, err.response.data);
-                } else {
-                    console.error(`❌ SMS Request Error (${cleanedPhone}):`, err.message);
+            const response = await axios.get(
+                'https://app.notify.lk/api/v1/send',
+                {
+                    params: {
+                        user_id: process.env.NOTIFY_USER_ID,
+                        api_key: process.env.NOTIFY_API_KEY,
+                        sender_id: process.env.NOTIFY_SENDER_ID,
+                        to: cleanedPhone,
+                        message: messageText
+                    },
+                    timeout: 15000
                 }
-            });
-    });
+            );
+
+            console.log(
+                `Notify.lk Response for ${cleanedPhone}:`,
+                response.data
+            );
+
+        } catch (error) {
+
+            console.error(
+                `Notify.lk SMS Error for ${cleanedPhone}:`,
+                error.response?.data || error.message
+            );
+        }
+    }
 }
+
+// ==================================================
+// 9. RAILWAY HTTP HEALTH SERVER
+// ==================================================
+
+const healthServer = http.createServer((req, res) => {
+
+    if (req.url === '/health') {
+
+        res.writeHead(200, {
+            'Content-Type': 'application/json'
+        });
+
+        res.end(JSON.stringify({
+            status: 'online',
+            service: 'HydroSentinel Flood Alert Server',
+            mqtt: client.connected ? 'connected' : 'disconnected',
+            timestamp: new Date().toISOString()
+        }));
+
+    } else {
+
+        res.writeHead(200, {
+            'Content-Type': 'text/plain'
+        });
+
+        res.end('HydroSentinel Flood Alert Server is running!');
+    }
+});
+
+healthServer.listen(PORT, '0.0.0.0', () => {
+    console.log(`HTTP Server Running on Port ${PORT}`);
+    console.log(`Health Check: /health`);
+});
+
+// ==================================================
+// 10. GRACEFUL SHUTDOWN
+// ==================================================
+
+async function shutdown() {
+
+    console.log('Shutting down server...');
+
+    try {
+        await new Promise(resolve => {
+            client.end(false, {}, resolve);
+        });
+
+        await writeApi.close();
+
+        healthServer.close(() => {
+            console.log('Server shutdown completed');
+            process.exit(0);
+        });
+
+    } catch (error) {
+        console.error('Shutdown Error:', error.message);
+        process.exit(1);
+    }
+}
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
