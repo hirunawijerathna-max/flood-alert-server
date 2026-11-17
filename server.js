@@ -7,15 +7,19 @@ const axios = require('axios');
 const { InfluxDB, Point } = require('@influxdata/influxdb-client');
 const { createClient } = require('@supabase/supabase-js');
 
+// ==========================================
+// 1. SERVER START
+// ==========================================
+
 console.log('======================================');
 console.log('HYDROSENTINEL SERVER STARTING...');
 console.log('======================================');
 
-// ==========================================
-// 1. ENVIRONMENT VARIABLES
-// ==========================================
-
 const PORT = process.env.PORT || 3000;
+
+// ==========================================
+// 2. ENVIRONMENT VARIABLES CHECK
+// ==========================================
 
 const requiredVariables = [
     'MQTT_HOST',
@@ -39,14 +43,17 @@ const missingVariables = requiredVariables.filter(
 );
 
 if (missingVariables.length > 0) {
-    console.error('MISSING VARIABLES:', missingVariables.join(', '));
+    console.error(
+        'MISSING ENVIRONMENT VARIABLES:',
+        missingVariables.join(', ')
+    );
     process.exit(1);
 }
 
-console.log('Environment variables check: PASSED');
+console.log('Environment variables check PASSED');
 
 // ==========================================
-// 2. SUPABASE
+// 3. SUPABASE SETUP
 // ==========================================
 
 const supabase = createClient(
@@ -54,10 +61,10 @@ const supabase = createClient(
     process.env.SUPABASE_KEY
 );
 
-console.log('Supabase client initialized');
+console.log('Supabase initialized');
 
 // ==========================================
-// 3. INFLUXDB
+// 4. INFLUXDB SETUP
 // ==========================================
 
 const influxDB = new InfluxDB({
@@ -70,10 +77,10 @@ const writeApi = influxDB.getWriteApi(
     process.env.INFLUX_BUCKET
 );
 
-console.log('InfluxDB client initialized');
+console.log('InfluxDB initialized');
 
 // ==========================================
-// 4. HTTP HEALTH SERVER
+// 5. SERVER HEALTH CHECK
 // ==========================================
 
 let mqttConnected = false;
@@ -102,31 +109,44 @@ const healthServer = http.createServer((req, res) => {
             'Content-Type': 'text/plain'
         });
 
-        res.end('HydroSentinel Flood Alert Server is Running!');
+        res.end('HydroSentinel Server Running!');
     }
 });
 
 healthServer.listen(PORT, '0.0.0.0', () => {
-    console.log(`HTTP SERVER RUNNING ON PORT ${PORT}`);
+    console.log(`HTTP Server Running on Port ${PORT}`);
 });
 
 // ==========================================
-// 5. MQTT CONNECTION
+// 6. MQTT CONFIGURATION
 // ==========================================
 
-console.log('Connecting to HiveMQ Cloud...');
-
 const mqttOptions = {
-    port: Number(process.env.MQTT_PORT),
     username: process.env.MQTT_USER,
     password: process.env.MQTT_PASS,
     protocol: 'mqtts',
-    rejectUnauthorized: true,
+    port: Number(process.env.MQTT_PORT),
     reconnectPeriod: 5000,
     connectTimeout: 30000,
+    clean: true,
     clientId: 'HydroSentinel_' +
         Math.random().toString(16).substring(2, 10)
 };
+
+console.log('======================================');
+console.log('MQTT CONFIG CHECK');
+console.log('Host configured:', !!process.env.MQTT_HOST);
+console.log('Port:', process.env.MQTT_PORT);
+console.log('Username configured:', !!process.env.MQTT_USER);
+console.log('Password configured:', !!process.env.MQTT_PASS);
+console.log('Topic:', process.env.MQTT_TOPIC);
+console.log('======================================');
+
+// ==========================================
+// 7. CONNECT TO HIVEMQ
+// ==========================================
+
+console.log('Connecting to HiveMQ Cloud...');
 
 const client = mqtt.connect(
     process.env.MQTT_HOST,
@@ -144,13 +164,13 @@ client.on('connect', () => {
     client.subscribe(
         process.env.MQTT_TOPIC,
         { qos: 1 },
-        (error) => {
+        (err) => {
 
-            if (error) {
-                console.error('MQTT SUBSCRIBE ERROR:', error.message);
+            if (err) {
+                console.error('SUBSCRIBE ERROR:', err);
             } else {
                 console.log(
-                    'SUBSCRIBED TO:',
+                    'SUBSCRIBED:',
                     process.env.MQTT_TOPIC
                 );
             }
@@ -158,8 +178,9 @@ client.on('connect', () => {
     );
 });
 
-client.on('error', (error) => {
-    console.error('MQTT ERROR:', error.message);
+client.on('error', (err) => {
+    console.error('MQTT ERROR DETAILS:', err);
+    console.error('MQTT ERROR CODE:', err.code);
 });
 
 client.on('reconnect', () => {
@@ -168,7 +189,7 @@ client.on('reconnect', () => {
 
 client.on('offline', () => {
     mqttConnected = false;
-    console.log('MQTT CLIENT OFFLINE');
+    console.log('MQTT OFFLINE');
 });
 
 client.on('close', () => {
@@ -177,13 +198,13 @@ client.on('close', () => {
 });
 
 // ==========================================
-// 6. ALERT STATE
+// 8. ALERT STATE
 // ==========================================
 
 let activeAlerts = {};
 
 // ==========================================
-// 7. MQTT MESSAGE RECEIVING
+// 9. RECEIVE MQTT MESSAGES
 // ==========================================
 
 let processingQueue = Promise.resolve();
@@ -202,12 +223,15 @@ client.on('message', (topic, message) => {
     processingQueue = processingQueue
         .then(() => processSensorData(topic, message))
         .catch(error => {
-            console.error('PROCESSING ERROR:', error.message);
+            console.error(
+                'MESSAGE PROCESSING ERROR:',
+                error.message
+            );
         });
 });
 
 // ==========================================
-// 8. PROCESS SENSOR DATA
+// 10. PROCESS SENSOR DATA
 // ==========================================
 
 async function processSensorData(topic, message) {
@@ -229,16 +253,16 @@ async function processSensorData(topic, message) {
         !Number.isFinite(waterLevel) ||
         !Number.isFinite(battery)
     ) {
-        console.error('INVALID SENSOR VALUES');
+        console.error('INVALID SENSOR DATA');
         return;
     }
 
     console.log('SENSOR ID:', sensorId);
-    console.log('WATER LEVEL:', waterLevel);
-    console.log('BATTERY:', battery);
+    console.log('WATER LEVEL:', waterLevel, 'm');
+    console.log('BATTERY:', battery, '%');
 
     // ======================================
-    // 8A. SAVE DATA TO INFLUXDB
+    // 10A. SAVE TO INFLUXDB
     // ======================================
 
     try {
@@ -249,16 +273,17 @@ async function processSensorData(topic, message) {
             .floatField('battery_pct', battery);
 
         writeApi.writePoint(point);
+
         await writeApi.flush();
 
-        console.log('INFLUXDB: DATA SAVED');
+        console.log('INFLUXDB DATA SAVED SUCCESSFULLY');
 
     } catch (error) {
         console.error('INFLUXDB ERROR:', error.message);
     }
 
     // ======================================
-    // 8B. GET THRESHOLDS FROM SUPABASE
+    // 10B. SUPABASE THRESHOLD CHECK
     // ======================================
 
     try {
@@ -271,11 +296,10 @@ async function processSensorData(topic, message) {
         if (error) throw error;
 
         if (!areas || areas.length === 0) {
-            console.log('NO AREAS FOUND');
+            console.log('NO AREAS FOUND IN SUPABASE');
             return;
         }
 
-        // Highest threshold crossed by current water level
         let maxCrossedThreshold = 0;
 
         for (const area of areas) {
@@ -293,20 +317,18 @@ async function processSensorData(topic, message) {
             }
         }
 
-        // Process each configured area
         for (const area of areas) {
 
             const areaName = area.area_name;
             const threshold = Number(area.min_threshold);
 
-            const lastState =
-                activeAlerts[area.id] ?? 'NORMAL';
-
             if (!Number.isFinite(threshold)) {
                 continue;
             }
 
-            // WATER LEVEL ABOVE THRESHOLD
+            const lastState =
+                activeAlerts[area.id] ?? 'NORMAL';
+
             if (waterLevel >= threshold) {
 
                 if (
@@ -333,7 +355,6 @@ async function processSensorData(topic, message) {
                         waterLevel,
                         direction
                     );
-
                 }
 
                 activeAlerts[area.id] = maxCrossedThreshold;
@@ -361,7 +382,7 @@ async function processSensorData(topic, message) {
 }
 
 // ==========================================
-// 9. GET USERS AND SEND SMS
+// 11. GET USERS FROM SUPABASE
 // ==========================================
 
 async function notifyAreaUsers(
@@ -384,7 +405,7 @@ async function notifyAreaUsers(
             .filter(Boolean);
 
         if (phoneNumbers.length === 0) {
-            console.log('NO USERS FOR AREA:', area.area_name);
+            console.log('NO USERS FOUND:', area.area_name);
             return;
         }
 
@@ -401,7 +422,7 @@ async function notifyAreaUsers(
 }
 
 // ==========================================
-// 10. NOTIFY.LK SMS
+// 12. NOTIFY.LK SMS
 // ==========================================
 
 async function sendCustomSMS(
@@ -426,7 +447,7 @@ async function sendCustomSMS(
     } else {
 
         messageText =
-            `WATER LEVEL DROP: ${areaName}. Current level: ${level}m. Please follow official updates.`;
+            `WATER LEVEL DROP: ${areaName}. Current level: ${level}m. Follow official updates.`;
     }
 
     for (const phoneNumber of phoneNumbers) {
@@ -457,10 +478,7 @@ async function sendCustomSMS(
                 }
             );
 
-            console.log(
-                'SMS RESPONSE:',
-                response.data
-            );
+            console.log('SMS RESPONSE:', response.data);
 
         } catch (error) {
 
@@ -473,33 +491,43 @@ async function sendCustomSMS(
 }
 
 // ==========================================
-// 11. SHUTDOWN
+// 13. GRACEFUL SHUTDOWN
 // ==========================================
+
+let shuttingDown = false;
 
 async function shutdown() {
 
+    if (shuttingDown) return;
+    shuttingDown = true;
+
     console.log('SERVER SHUTTING DOWN...');
 
+    client.end(true);
+
     try {
-
-        client.end(true);
-
         await writeApi.close();
-
-        healthServer.close(() => {
-            console.log('HTTP SERVER CLOSED');
-            process.exit(0);
-        });
-
     } catch (error) {
-
-        console.error('SHUTDOWN ERROR:', error.message);
-        process.exit(1);
+        console.error('INFLUX CLOSE ERROR:', error.message);
     }
+
+    healthServer.close(() => {
+        console.log('HTTP SERVER CLOSED');
+        process.exit(0);
+    });
+
+    setTimeout(() => {
+        console.error('FORCED SHUTDOWN');
+        process.exit(1);
+    }, 10000).unref();
 }
 
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
+
+// ==========================================
+// 14. GLOBAL ERROR HANDLERS
+// ==========================================
 
 process.on('uncaughtException', error => {
     console.error('UNCAUGHT EXCEPTION:', error);
